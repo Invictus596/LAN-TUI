@@ -1,4 +1,7 @@
 use std::io;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -46,22 +49,41 @@ struct Node {
     name: &'static str,
     ip: &'static str,
     kind: &'static str,
+    latency_ms: f64,
 }
 
 impl Node {
     fn mock_nodes() -> Vec<Self> {
         vec![
-            Node { name: "Router", ip: "192.168.1.1", kind: "Gateway" },
-            Node { name: "Laptop", ip: "192.168.1.42", kind: "Client" },
-            Node { name: "Phone", ip: "192.168.1.67", kind: "Client" },
-            Node { name: "Printer", ip: "192.168.1.15", kind: "Peripheral" },
+            Node { name: "Router", ip: "192.168.1.1", kind: "Gateway", latency_ms: 1.2 },
+            Node { name: "Laptop", ip: "192.168.1.42", kind: "Client", latency_ms: 3.7 },
+            Node { name: "Phone", ip: "192.168.1.67", kind: "Client", latency_ms: 5.1 },
+            Node { name: "Printer", ip: "192.168.1.15", kind: "Peripheral", latency_ms: 8.4 },
         ]
     }
+}
+
+fn simulate_scan(current: &[Node], tick: u64) -> Vec<Node> {
+    current
+        .iter()
+        .map(|n| {
+            let jitter = ((tick.wrapping_mul(7).wrapping_add(n.name.len() as u64 * 13)) % 30) as f64
+                * 0.3;
+            let base = n.latency_ms;
+            let delta = jitter - 4.5;
+            let next = (base + delta).clamp(0.5, 99.9);
+            Node {
+                latency_ms: (next * 10.0).round() / 10.0,
+                ..n.clone()
+            }
+        })
+        .collect()
 }
 
 struct App {
     state: StateMachine,
     nodes: Vec<Node>,
+    last_update: String,
 }
 
 impl App {
@@ -69,6 +91,7 @@ impl App {
         Self {
             state: StateMachine::Splash,
             nodes: Node::mock_nodes(),
+            last_update: String::from("—"),
         }
     }
 
@@ -84,10 +107,30 @@ fn main() -> io::Result<()> {
     stdout.execute(EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    let (tx, rx) = mpsc::channel();
+    let initial_nodes = Node::mock_nodes();
+    thread::spawn(move || {
+        let mut nodes = initial_nodes;
+        let mut tick = 0u64;
+        loop {
+            thread::sleep(Duration::from_secs(2 + (tick % 2)));
+            tick += 1;
+            nodes = simulate_scan(&nodes, tick);
+            if tx.send(nodes.clone()).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut app = App::new();
     let mut result: io::Result<()> = Ok(());
 
     while result.is_ok() {
+        if let Ok(fresh) = rx.try_recv() {
+            app.nodes = fresh;
+            app.last_update = format!("last scan: {}", humantime_since_epoch());
+        }
         terminal.draw(|f| ui(f, &app))?;
         result = handle_events(&mut app);
     }
@@ -95,6 +138,17 @@ fn main() -> io::Result<()> {
     disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     result
+}
+
+fn humantime_since_epoch() -> String {
+    let since = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = since.as_secs() % 86400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
 fn handle_events(app: &mut App) -> io::Result<()> {
@@ -114,20 +168,22 @@ fn handle_events(app: &mut App) -> io::Result<()> {
 
 fn ui(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
-    render_status_bar(frame, area, app.state);
+    render_status_bar(frame, area, app);
     render_main_content(frame, area, app);
 }
 
-fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, state: StateMachine) {
+fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]);
     let [main_area, status_area] = layout.areas(area);
 
     let status = Line::from(vec![
         Span::styled(
-            format!(" STATE: {} ", state.label()),
+            format!(" STATE: {} ", app.state.label()),
             Style::new().fg(Color::White).bg(Color::DarkGray),
         ),
         Span::raw(" — "),
+        Span::styled(&app.last_update, Style::new().fg(Color::Green)),
+        Span::raw("  "),
         Span::styled("Enter", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" next · "),
         Span::styled("q", Style::new().fg(Color::Cyan).bold()),
@@ -179,7 +235,9 @@ fn render_animating_intro(frame: &mut ratatui::Frame, area: Rect) {
         Line::from(""),
         Line::from("[ Scanning network... ]"),
         Line::from(""),
-        Line::from(Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray))),
+        Line::from(
+            Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray)),
+        ),
     ];
     frame.render_widget(
         Paragraph::new(text)
@@ -195,11 +253,23 @@ fn render_graph(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
     ))
     .chain(std::iter::once(Line::from("")))
     .chain(nodes.iter().map(|node| {
+        let latency_color = if node.latency_ms < 2.0 {
+            Color::Green
+        } else if node.latency_ms < 8.0 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
         Line::from(vec![
             Span::styled(format!("◉  {} ", node.name), Style::new().fg(Color::Cyan).bold()),
             Span::styled(node.ip, Style::new().fg(Color::White)),
             Span::raw("  "),
             Span::styled(format!("[{}]", node.kind), Style::new().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:.1}ms", node.latency_ms),
+                Style::new().fg(latency_color).bold(),
+            ),
         ])
     }))
     .chain(std::iter::once(Line::from("")))
@@ -209,7 +279,9 @@ fn render_graph(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
     .collect();
 
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -221,7 +293,7 @@ fn render_animating_zoom(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node])
     .chain(std::iter::once(Line::from("")))
     .chain(nodes.iter().map(|node| {
         Line::from(Span::styled(
-            format!("  ~ zooming to {} ...", node.name),
+            format!("  ~ zooming to {} ({:.1}ms) ...", node.name, node.latency_ms),
             Style::new().fg(Color::Blue),
         ))
     }))
@@ -240,21 +312,44 @@ fn render_animating_zoom(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node])
 }
 
 fn render_detail(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
-    let lines: Vec<Line> = std::iter::once(Line::from(
+    let mut lines = vec![Line::from(
         Span::styled("NODE DETAIL", Style::new().fg(Color::Cyan).bold()),
-    ))
-    .chain(std::iter::once(Line::from("")))
-    .chain(nodes.iter().map(|node| {
-        Line::from(vec![
-            Span::styled("┌─ ", Style::new().fg(Color::DarkGray)),
+    )];
+    lines.push(Line::from(""));
+
+    for node in nodes {
+        let latency_color = if node.latency_ms < 2.0 {
+            Color::Green
+        } else if node.latency_ms < 8.0 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            Span::styled("├─ ", Style::new().fg(Color::DarkGray)),
             Span::styled(node.name, Style::new().fg(Color::Cyan).bold()),
-        ])
-    }))
-    .chain(std::iter::once(Line::from("")))
-    .chain(std::iter::once(Line::from(
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│   IP: ", Style::new().fg(Color::DarkGray)),
+            Span::styled(node.ip, Style::new().fg(Color::White)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│   Kind: ", Style::new().fg(Color::DarkGray)),
+            Span::styled(node.kind, Style::new().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│   Latency: ", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{:.1}ms", node.latency_ms),
+                Style::new().fg(latency_color).bold(),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    lines.push(Line::from(
         Span::styled("(Placeholder — Enter to restart)", Style::new().fg(Color::DarkGray)),
-    )))
-    .collect();
+    ));
 
     frame.render_widget(
         Paragraph::new(lines)
