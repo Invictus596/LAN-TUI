@@ -84,6 +84,7 @@ struct App {
     state: StateMachine,
     nodes: Vec<Node>,
     last_update: String,
+    scan_count: u64,
 }
 
 impl App {
@@ -92,6 +93,7 @@ impl App {
             state: StateMachine::Splash,
             nodes: Node::mock_nodes(),
             last_update: String::from("—"),
+            scan_count: 0,
         }
     }
 
@@ -129,6 +131,7 @@ fn main() -> io::Result<()> {
     while result.is_ok() {
         if let Ok(fresh) = rx.try_recv() {
             app.nodes = fresh;
+            app.scan_count += 1;
             app.last_update = format!("last scan: {}", humantime_since_epoch());
         }
         terminal.draw(|f| ui(f, &app))?;
@@ -176,6 +179,12 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let layout = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]);
     let [main_area, status_area] = layout.areas(area);
 
+    let avg: f64 = if app.nodes.is_empty() {
+        0.0
+    } else {
+        app.nodes.iter().map(|n| n.latency_ms).sum::<f64>() / app.nodes.len() as f64
+    };
+
     let status = Line::from(vec![
         Span::styled(
             format!(" STATE: {} ", app.state.label()),
@@ -183,6 +192,16 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ),
         Span::raw(" — "),
         Span::styled(&app.last_update, Style::new().fg(Color::Green)),
+        Span::raw("  "),
+        Span::styled(
+            format!("scans: {}", app.scan_count),
+            Style::new().fg(Color::Blue),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("avg: {:.1}ms", avg),
+            Style::new().fg(Color::Yellow),
+        ),
         Span::raw("  "),
         Span::styled("Enter", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" next · "),
