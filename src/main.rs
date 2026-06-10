@@ -10,8 +10,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::canvas::{Canvas, Context, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+
+const ZOOM_DURATION: f64 = 60.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum StateMachine {
@@ -50,17 +53,24 @@ struct Node {
     ip: &'static str,
     kind: &'static str,
     latency_ms: f64,
+    x: f64,
+    y: f64,
+    z: f64,
 }
 
 impl Node {
     fn mock_nodes() -> Vec<Self> {
         vec![
-            Node { name: "Router", ip: "192.168.1.1", kind: "Gateway", latency_ms: 1.2 },
-            Node { name: "Laptop", ip: "192.168.1.42", kind: "Client", latency_ms: 3.7 },
-            Node { name: "Phone", ip: "192.168.1.67", kind: "Client", latency_ms: 5.1 },
-            Node { name: "Printer", ip: "192.168.1.15", kind: "Peripheral", latency_ms: 8.4 },
+            Node { name: "Router", ip: "192.168.1.1", kind: "Gateway", latency_ms: 1.2, x: 0.0, y: 0.0, z: 0.0 },
+            Node { name: "Laptop", ip: "192.168.1.42", kind: "Client", latency_ms: 3.7, x: 5.0, y: 3.0, z: 1.0 },
+            Node { name: "Phone", ip: "192.168.1.67", kind: "Client", latency_ms: 5.1, x: -4.0, y: 4.5, z: 0.5 },
+            Node { name: "Printer", ip: "192.168.1.15", kind: "Peripheral", latency_ms: 8.4, x: 3.5, y: -5.0, z: 1.2 },
         ]
     }
+}
+
+fn edge_indices() -> Vec<(usize, usize)> {
+    vec![(0, 1), (0, 2), (0, 3)]
 }
 
 fn simulate_scan(current: &[Node], tick: u64) -> Vec<Node> {
@@ -80,11 +90,49 @@ fn simulate_scan(current: &[Node], tick: u64) -> Vec<Node> {
         .collect()
 }
 
+struct Camera {
+    target_idx: usize,
+    zoom_progress: f64,
+    base_scale: f64,
+    zoom_scale: f64,
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self { target_idx: 0, zoom_progress: 0.0, base_scale: 1.0, zoom_scale: 3.5 }
+    }
+
+    fn scale(&self) -> f64 {
+        self.base_scale + self.zoom_progress * (self.zoom_scale - self.base_scale)
+    }
+
+    fn look_at_x(&self, nodes: &[Node]) -> f64 {
+        let t = nodes.get(self.target_idx).map(|n| n.x).unwrap_or(0.0);
+        self.zoom_progress * t
+    }
+
+    fn look_at_y(&self, nodes: &[Node]) -> f64 {
+        let t = nodes.get(self.target_idx).map(|n| n.y).unwrap_or(0.0);
+        self.zoom_progress * t
+    }
+
+    fn reset(&mut self) {
+        self.zoom_progress = 0.0;
+    }
+}
+
+fn project(node: &Node, look_at_x: f64, look_at_y: f64, scale: f64) -> (f64, f64) {
+    let dx = node.x - look_at_x;
+    let dy = node.y - look_at_y;
+    (dx * scale, dy * scale)
+}
+
 struct App {
     state: StateMachine,
     nodes: Vec<Node>,
     last_update: String,
     scan_count: u64,
+    camera: Camera,
 }
 
 impl App {
@@ -94,11 +142,39 @@ impl App {
             nodes: Node::mock_nodes(),
             last_update: String::from("—"),
             scan_count: 0,
+            camera: Camera::new(),
         }
     }
 
     fn advance(&mut self) {
-        self.state = self.state.transition();
+        match self.state {
+            StateMachine::Graph => {
+                let next = (self.camera.target_idx + 1) % self.nodes.len();
+                self.camera.target_idx = next;
+                self.camera.zoom_progress = 0.0;
+                self.state = self.state.transition();
+            }
+            StateMachine::AnimatingZoom => {
+                self.camera.zoom_progress = 1.0;
+                self.state = self.state.transition();
+            }
+            StateMachine::Detail => {
+                self.camera.reset();
+                self.state = self.state.transition();
+            }
+            _ => {
+                self.state = self.state.transition();
+            }
+        }
+    }
+
+    fn update(&mut self) {
+        if self.state == StateMachine::AnimatingZoom {
+            self.camera.zoom_progress = (self.camera.zoom_progress + 1.0 / ZOOM_DURATION).min(1.0);
+            if self.camera.zoom_progress >= 1.0 {
+                self.state = StateMachine::Detail;
+            }
+        }
     }
 }
 
@@ -126,21 +202,22 @@ fn main() -> io::Result<()> {
     });
 
     let mut app = App::new();
-    let mut result: io::Result<()> = Ok(());
+    let mut running = true;
 
-    while result.is_ok() {
+    while running {
         if let Ok(fresh) = rx.try_recv() {
             app.nodes = fresh;
             app.scan_count += 1;
             app.last_update = format!("last scan: {}", humantime_since_epoch());
         }
+        app.update();
         terminal.draw(|f| ui(f, &app))?;
-        result = handle_events(&mut app);
+        running = handle_events(&mut app)?;
     }
 
     disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    result
+    Ok(())
 }
 
 fn humantime_since_epoch() -> String {
@@ -154,19 +231,19 @@ fn humantime_since_epoch() -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-fn handle_events(app: &mut App) -> io::Result<()> {
-    if let Event::Key(key) = event::read()? {
-        if key.kind == KeyEventKind::Press {
-            match key.code {
-                KeyCode::Enter => app.advance(),
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(());
+fn handle_events(app: &mut App) -> io::Result<bool> {
+    if event::poll(Duration::from_millis(16))? {
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Enter => app.advance(),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn ui(frame: &mut ratatui::Frame, app: &App) {
@@ -193,15 +270,9 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         Span::raw(" — "),
         Span::styled(&app.last_update, Style::new().fg(Color::Green)),
         Span::raw("  "),
-        Span::styled(
-            format!("scans: {}", app.scan_count),
-            Style::new().fg(Color::Blue),
-        ),
+        Span::styled(format!("scans: {}", app.scan_count), Style::new().fg(Color::Blue)),
         Span::raw("  "),
-        Span::styled(
-            format!("avg: {:.1}ms", avg),
-            Style::new().fg(Color::Yellow),
-        ),
+        Span::styled(format!("avg: {:.1}ms", avg), Style::new().fg(Color::Yellow)),
         Span::raw("  "),
         Span::styled("Enter", Style::new().fg(Color::Cyan).bold()),
         Span::raw(" next · "),
@@ -226,9 +297,9 @@ fn render_main_content(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     match app.state {
         StateMachine::Splash => render_splash(frame, content_area),
         StateMachine::AnimatingIntro => render_animating_intro(frame, content_area),
-        StateMachine::Graph => render_graph(frame, content_area, &app.nodes),
-        StateMachine::AnimatingZoom => render_animating_zoom(frame, content_area, &app.nodes),
-        StateMachine::Detail => render_detail(frame, content_area, &app.nodes),
+        StateMachine::Graph => render_graph_canvas(frame, content_area, app),
+        StateMachine::AnimatingZoom => render_zoom_canvas(frame, content_area, app),
+        StateMachine::Detail => render_detail(frame, content_area, app),
     }
 }
 
@@ -241,9 +312,7 @@ fn render_splash(frame: &mut ratatui::Frame, area: Rect) {
         Line::from(Span::styled("Press Enter to begin", Style::new().fg(Color::Cyan))),
     ];
     frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(text).alignment(Alignment::Center).wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -254,89 +323,115 @@ fn render_animating_intro(frame: &mut ratatui::Frame, area: Rect) {
         Line::from(""),
         Line::from("[ Scanning network... ]"),
         Line::from(""),
-        Line::from(
-            Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray)),
-        ),
+        Line::from(Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray))),
     ];
     frame.render_widget(
-        Paragraph::new(text)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(text).alignment(Alignment::Center).wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn render_graph(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
-    let lines: Vec<Line> = std::iter::once(Line::from(
-        Span::styled("NETWORK GRAPH", Style::new().fg(Color::Green).bold()),
-    ))
-    .chain(std::iter::once(Line::from("")))
-    .chain(nodes.iter().map(|node| {
-        let latency_color = if node.latency_ms < 2.0 {
-            Color::Green
-        } else if node.latency_ms < 8.0 {
-            Color::Yellow
-        } else {
-            Color::Red
-        };
-        Line::from(vec![
-            Span::styled(format!("◉  {} ", node.name), Style::new().fg(Color::Cyan).bold()),
-            Span::styled(node.ip, Style::new().fg(Color::White)),
-            Span::raw("  "),
-            Span::styled(format!("[{}]", node.kind), Style::new().fg(Color::DarkGray)),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:.1}ms", node.latency_ms),
-                Style::new().fg(latency_color).bold(),
-            ),
-        ])
-    }))
-    .chain(std::iter::once(Line::from("")))
-    .chain(std::iter::once(Line::from(
-        Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray)),
-    )))
-    .collect();
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+fn draw_edges(ctx: &mut Context<'_>, nodes: &[Node]) {
+    for (i, j) in &edge_indices() {
+        if let (Some(a), Some(b)) = (nodes.get(*i), nodes.get(*j)) {
+            ctx.draw(&CanvasLine {
+                x1: a.x,
+                y1: a.y,
+                x2: b.x,
+                y2: b.y,
+                color: Color::DarkGray,
+            });
+        }
+    }
 }
 
-fn render_animating_zoom(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
-    let lines: Vec<Line> = std::iter::once(Line::from(
-        Span::styled("ANIMATING ZOOM", Style::new().fg(Color::Yellow).bold()),
-    ))
-    .chain(std::iter::once(Line::from("")))
-    .chain(nodes.iter().map(|node| {
-        Line::from(Span::styled(
-            format!("  ~ zooming to {} ({:.1}ms) ...", node.name, node.latency_ms),
-            Style::new().fg(Color::Blue),
-        ))
-    }))
-    .chain(std::iter::once(Line::from("")))
-    .chain(std::iter::once(Line::from(
-        Span::styled("(Placeholder — Enter to continue)", Style::new().fg(Color::DarkGray)),
-    )))
-    .collect();
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+fn draw_node_dot(ctx: &mut Context<'_>, x: f64, y: f64, color: Color) {
+    struct Dot(f64, f64, Color);
+    impl ratatui::widgets::canvas::Shape for Dot {
+        fn draw(&self, p: &mut ratatui::widgets::canvas::Painter) {
+            if let Some((px, py)) = p.get_point(self.0, self.1) {
+                p.paint(px, py, self.2);
+            }
+        }
+    }
+    ctx.draw(&Dot(x, y, color));
 }
 
-fn render_detail(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
-    let mut lines = vec![Line::from(
-        Span::styled("NODE DETAIL", Style::new().fg(Color::Cyan).bold()),
-    )];
-    lines.push(Line::from(""));
+fn render_graph_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let scale = app.camera.scale();
+    let look_at_x = app.camera.look_at_x(&app.nodes);
+    let look_at_y = app.camera.look_at_y(&app.nodes);
+    let extent = 12.0 / scale;
 
-    for node in nodes {
+    let canvas = Canvas::default()
+        .x_bounds([-extent + look_at_x, extent + look_at_x])
+        .y_bounds([-extent + look_at_y, extent + look_at_y])
+        .paint(|ctx| {
+            draw_edges(ctx, &app.nodes);
+            for node in &app.nodes {
+                draw_node_dot(ctx, node.x, node.y, Color::Cyan);
+                ctx.print(node.x, node.y - 0.6, format!("◉ {}", node.name));
+                ctx.print(node.x, node.y - 1.2, format!("{:.1}ms", node.latency_ms));
+            }
+        });
+
+    frame.render_widget(canvas, area);
+}
+
+fn render_zoom_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let scale = app.camera.scale();
+    let look_at_x = app.camera.look_at_x(&app.nodes);
+    let look_at_y = app.camera.look_at_y(&app.nodes);
+    let extent = 12.0 / scale;
+
+    let canvas = Canvas::default()
+        .x_bounds([-extent + look_at_x, extent + look_at_x])
+        .y_bounds([-extent + look_at_y, extent + look_at_y])
+        .paint(|ctx| {
+            draw_edges(ctx, &app.nodes);
+            for node in &app.nodes {
+                let dx = node.x - look_at_x;
+                let dy = node.y - look_at_y;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let fade = (1.0 - (dist / 8.0).clamp(0.0, 1.0)).max(0.1);
+                if fade > 0.1 {
+                    draw_node_dot(ctx, node.x, node.y, Color::Cyan);
+                    ctx.print(node.x, node.y - 0.6, format!("◉ {}", node.name));
+                }
+                ctx.print(node.x, node.y + 0.4, format!("{:.1}ms", node.latency_ms));
+            }
+        });
+
+    let overlay = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("ZOOMING → {}", app.nodes[app.camera.target_idx].name),
+            Style::new().fg(Color::Yellow).bold(),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:.0}%", app.camera.zoom_progress * 100.0),
+            Style::new().fg(Color::Cyan),
+        ),
+    ]))
+    .alignment(Alignment::Center);
+    frame.render_widget(canvas, area);
+    let top = Rect::new(area.x, area.y, area.width, 1);
+    frame.render_widget(overlay, top);
+}
+
+fn render_detail(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let mut lines = vec![
+        Line::from(Span::styled("NODE DETAIL", Style::new().fg(Color::Cyan).bold())),
+        Line::from(""),
+    ];
+
+    for node in &app.nodes {
+        let (px, py) = project(
+            node,
+            app.camera.look_at_x(&app.nodes),
+            app.camera.look_at_y(&app.nodes),
+            app.camera.scale(),
+        );
         let latency_color = if node.latency_ms < 2.0 {
             Color::Green
         } else if node.latency_ms < 8.0 {
@@ -358,22 +453,33 @@ fn render_detail(frame: &mut ratatui::Frame, area: Rect, nodes: &[Node]) {
         ]));
         lines.push(Line::from(vec![
             Span::styled("│   Latency: ", Style::new().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:.1}ms", node.latency_ms),
-                Style::new().fg(latency_color).bold(),
-            ),
+            Span::styled(format!("{:.1}ms", node.latency_ms), Style::new().fg(latency_color).bold()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("│   3D: (", Style::new().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}", node.x), Style::new().fg(Color::Blue)),
+            Span::styled(", ", Style::new().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}", node.y), Style::new().fg(Color::Blue)),
+            Span::styled(", ", Style::new().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}", node.z), Style::new().fg(Color::Magenta)),
+            Span::styled(") -> 2D: (", Style::new().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}", px), Style::new().fg(Color::Green)),
+            Span::styled(", ", Style::new().fg(Color::DarkGray)),
+            Span::styled(format!("{:.1}", py), Style::new().fg(Color::Green)),
+            Span::styled(")", Style::new().fg(Color::DarkGray)),
         ]));
         lines.push(Line::from(""));
     }
 
-    lines.push(Line::from(
-        Span::styled("(Placeholder — Enter to restart)", Style::new().fg(Color::DarkGray)),
-    ));
+    lines.push(Line::from(Span::styled(
+        "(Placeholder — Enter to restart)",
+        Style::new().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines).alignment(Alignment::Center).wrap(Wrap { trim: false }),
         area,
     );
 }
+
+
