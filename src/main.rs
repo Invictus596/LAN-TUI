@@ -8,7 +8,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+    MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -251,6 +254,7 @@ struct App {
     pulse_phase: f64,
     intro_progress: f64,
     show_help: bool,
+    content_area: Rect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,6 +300,7 @@ impl App {
             pulse_phase: 0.0,
             intro_progress: 0.0,
             show_help: false,
+            content_area: Rect::new(0, 0, 0, 0),
         }
     }
 
@@ -345,6 +350,7 @@ fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -391,11 +397,18 @@ fn main() -> io::Result<()> {
             app.last_update = format!("last scan: {}", humantime_since_epoch());
         }
         app.update();
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| {
+            let area = f.area();
+            let ca = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)])
+                .split(area)[1];
+            app.content_area = ca;
+            ui(f, &app);
+        })?;
         running = handle_events(&mut app)?;
     }
 
     disable_raw_mode()?;
+    terminal.backend_mut().execute(DisableMouseCapture)?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     Ok(())
 }
@@ -413,46 +426,120 @@ fn humantime_since_epoch() -> String {
 
 fn handle_events(app: &mut App) -> io::Result<bool> {
     if event::poll(Duration::from_millis(16))? {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Enter => {
-                        if app.show_help {
-                            app.show_help = false;
-                        } else {
-                            app.advance();
-                        }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Enter => {
+                    if app.show_help {
+                        app.show_help = false;
+                    } else {
+                        app.advance();
                     }
-                    KeyCode::Char('?') | KeyCode::F(1) => {
-                        app.show_help = !app.show_help;
-                    }
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        if app.show_help {
-                            app.show_help = false;
-                        } else {
-                            return Ok(false);
-                        }
-                    }
-                    KeyCode::Left => {
-                        if !app.show_help && !app.nodes.is_empty() {
-                            app.selected_idx = if app.selected_idx == 0 {
-                                app.nodes.len() - 1
-                            } else {
-                                app.selected_idx - 1
-                            };
-                        }
-                    }
-                    KeyCode::Right => {
-                        if !app.show_help && !app.nodes.is_empty() {
-                            app.selected_idx = (app.selected_idx + 1) % app.nodes.len();
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                KeyCode::Char('?') | KeyCode::F(1) => {
+                    app.show_help = !app.show_help;
+                }
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if app.show_help {
+                        app.show_help = false;
+                    } else {
+                        return Ok(false);
+                    }
+                }
+                KeyCode::Left => {
+                    if !app.show_help && !app.nodes.is_empty() {
+                        app.selected_idx = if app.selected_idx == 0 {
+                            app.nodes.len() - 1
+                        } else {
+                            app.selected_idx - 1
+                        };
+                    }
+                }
+                KeyCode::Right => {
+                    if !app.show_help && !app.nodes.is_empty() {
+                        app.selected_idx = (app.selected_idx + 1) % app.nodes.len();
+                    }
+                }
+                _ => {}
+            },
+            Event::Mouse(m) => handle_mouse(app, m),
+            _ => {}
         }
     }
     Ok(true)
+}
+
+fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if app.show_help {
+                return;
+            }
+            let col = m.column;
+            let row = m.row;
+            let ca = app.content_area;
+
+            if row < ca.top() || row >= ca.bottom() || col < ca.left() || col >= ca.right() {
+                return;
+            }
+
+            match app.state {
+                StateMachine::Detail => {
+                    let rel_row = row - ca.y;
+                    let header_rows = 2u16;
+                    if rel_row >= header_rows {
+                        let idx = (rel_row - header_rows) as usize;
+                        if idx < app.nodes.len() {
+                            app.selected_idx = idx;
+                        }
+                    }
+                }
+                StateMachine::Graph => {
+                    if app.nodes.is_empty() {
+                        return;
+                    }
+                    let (ca_w, ca_h) = (ca.width.max(1), ca.height.max(1));
+                    let rel_col = (col - ca.x) as f64 / ca_w as f64;
+                    let rel_row = (row - ca.y) as f64 / ca_h as f64;
+
+                    let scale = app.camera.scale();
+                    let look_x = app.camera.look_at_x(&app.nodes);
+                    let look_y = app.camera.look_at_y(&app.nodes);
+                    let extent = 12.0 / scale;
+
+                    let canvas_x = -extent + look_x + rel_col * 2.0 * extent;
+                    let canvas_y = extent + look_y - rel_row * 2.0 * extent;
+
+                    let mut best = 0;
+                    let mut best_dist = f64::INFINITY;
+                    for (i, node) in app.nodes.iter().enumerate() {
+                        let dx = node.x - canvas_x;
+                        let dy = node.y - canvas_y;
+                        let d = dx * dx + dy * dy;
+                        if d < best_dist {
+                            best_dist = d;
+                            best = i;
+                        }
+                    }
+                    let threshold = (6.0 / scale).max(1.0);
+                    if best_dist.sqrt() < threshold {
+                        app.selected_idx = best;
+                    }
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if app.state == StateMachine::Graph {
+                app.camera.base_scale = (app.camera.base_scale + 0.3).min(5.0);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.state == StateMachine::Graph {
+                app.camera.base_scale = (app.camera.base_scale - 0.3).max(0.5);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn ui(frame: &mut ratatui::Frame, app: &App) {
