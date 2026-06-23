@@ -2,9 +2,12 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::io;
-use std::net::{SocketAddr, TcpStream};
+use std::io::BufRead;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -26,6 +29,9 @@ use serde::Deserialize;
 const ZOOM_DURATION: f64 = 60.0;
 const INTRO_DURATION: f64 = 90.0;
 const MAX_HISTORY: usize = 20;
+const SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const SWEEP_CONCURRENCY: usize = 20;
+const LAYOUT_ITER_PER_FRAME: usize = 8;
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -143,6 +149,69 @@ fn tcp_ping(ip: &str) -> Option<f64> {
     Some(start.elapsed().as_secs_f64() * 1000.0)
 }
 
+fn get_local_ip() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    if let std::net::IpAddr::V4(v4) = addr.ip() {
+        Some(v4)
+    } else {
+        None
+    }
+}
+
+fn sweep_subnet(concurrency: usize) -> Vec<String> {
+    let local_ip = match get_local_ip() {
+        Some(ip) => ip,
+        None => return Vec::new(),
+    };
+    let prefix = u32::from(local_ip) & 0xFFFFFF00;
+    let mut found = Vec::new();
+    let done = Arc::new(AtomicBool::new(false));
+
+    for offset in 1..=254 {
+        if done.load(Ordering::Relaxed) {
+            break;
+        }
+        let ip = Ipv4Addr::from(prefix | offset);
+        let addr = format!("{}:80", ip);
+        if let Ok(sa) = addr.parse::<SocketAddr>() {
+            if TcpStream::connect_timeout(&sa, Duration::from_millis(80)).is_ok() {
+                found.push(ip.to_string());
+                if found.len() >= concurrency {
+                    done.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    found
+}
+
+fn detect_interface() -> String {
+    if let Ok(file) = fs::File::open("/proc/net/route") {
+        let reader = io::BufReader::new(file);
+        for line in reader.lines().flatten().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts.get(1) == Some(&"00000000") {
+                return parts[0].to_string();
+            }
+        }
+    }
+    String::from("eth0")
+}
+
+fn read_traffic_bytes(iface: &str) -> (u64, u64) {
+    let rx = fs::read_to_string(format!("/sys/class/net/{}/statistics/rx_bytes", iface))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let tx = fs::read_to_string(format!("/sys/class/net/{}/statistics/tx_bytes", iface))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    (rx, tx)
+}
+
 fn spawn_scanner(
     tx: mpsc::Sender<Vec<Node>>,
     config_nodes: HashMap<String, NodeDef>,
@@ -153,10 +222,8 @@ fn spawn_scanner(
         .collect();
 
     thread::spawn(move || {
-        let mut tick = 0u64;
         loop {
-            thread::sleep(Duration::from_secs(2 + (tick % 2)));
-            tick += 1;
+            thread::sleep(SCAN_INTERVAL);
 
             let entries = parse_arp_entries();
             let arp_ips: HashMap<&str, &str> = entries
@@ -178,11 +245,22 @@ fn spawn_scanner(
 
             let existing_ips: std::collections::HashSet<String> =
                 known.iter().map(|n| n.ip.clone()).collect();
-            let new_entries = parse_arp_entries();
-            for (ip, _mac) in &new_entries {
+            for (ip, _mac) in &entries {
                 if !existing_ips.contains(ip) {
                     let mut n = Node::new_unknown(ip);
                     if let Some(ms) = tcp_ping(ip) {
+                        n.push_latency(ms);
+                    }
+                    known.push(n);
+                }
+            }
+
+            let subnet_ips: std::collections::HashSet<String> =
+                known.iter().map(|n| n.ip.clone()).collect();
+            for ip in sweep_subnet(SWEEP_CONCURRENCY) {
+                if !subnet_ips.contains(&ip) {
+                    let mut n = Node::new_unknown(&ip);
+                    if let Some(ms) = tcp_ping(&ip) {
                         n.push_latency(ms);
                     }
                     known.push(n);
@@ -231,22 +309,86 @@ fn project(node: &Node, look_at_x: f64, look_at_y: f64, scale: f64) -> (f64, f64
     ((node.x - look_at_x) * scale, (node.y - look_at_y) * scale)
 }
 
-fn edge_indices() -> Vec<(usize, usize)> {
-    vec![(0, 1), (0, 2), (0, 3)]
+fn build_edges(nodes: &[Node]) -> Vec<(usize, usize)> {
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+    let gateway_idx = nodes.iter().position(|n| n.kind == "Gateway").unwrap_or(0);
+    let mut edges = Vec::new();
+    for i in 0..nodes.len() {
+        if i != gateway_idx {
+            if !edges.iter().any(|(a, b)| (*a == gateway_idx && *b == i) || (*a == i && *b == gateway_idx)) {
+                edges.push((gateway_idx, i));
+            }
+        }
+    }
+    for i in 0..nodes.len() {
+        for j in (i + 1)..nodes.len() {
+            if i != gateway_idx && j != gateway_idx && nodes[i].kind == nodes[j].kind {
+                if !edges.iter().any(|(a, b)| (*a == i && *b == j) || (*a == j && *b == i)) {
+                    edges.push((i, j));
+                }
+            }
+        }
+    }
+    edges
 }
 
-fn neighbors_of(idx: usize) -> Vec<usize> {
-    edge_indices()
-        .into_iter()
-        .filter_map(|(a, b)| {
-            if a == idx { Some(b) } else if b == idx { Some(a) } else { None }
-        })
-        .collect()
+fn force_directed_layout(nodes: &mut [Node], edges: &[(usize, usize)], iters: usize) {
+    let n = nodes.len();
+    if n < 2 { return; }
+    let ideal_len = 4.0;
+    let repulsion = 20.0;
+    let attraction = 0.01;
+    let damping = 0.85;
+    let min_v = 0.01;
+
+    let mut vx = vec![0.0; n];
+    let mut vy = vec![0.0; n];
+
+    for _ in 0..iters {
+        for i in 0..n {
+            let mut fx = 0.0;
+            let mut fy = 0.0;
+
+            for j in 0..n {
+                if i == j { continue; }
+                let dx = nodes[j].x - nodes[i].x;
+                let dy = nodes[j].y - nodes[i].y;
+                let dist = (dx * dx + dy * dy).max(0.1);
+                let force = repulsion / (dist * dist);
+                fx -= force * dx / dist;
+                fy -= force * dy / dist;
+            }
+
+            for &(a, b) in edges {
+                let (src, tgt) = if a == i { (a, b) } else if b == i { (b, a) } else { continue; };
+                let dx = nodes[tgt].x - nodes[src].x;
+                let dy = nodes[tgt].y - nodes[src].y;
+                let dist = (dx * dx + dy * dy).max(0.1);
+                let force = attraction * (dist - ideal_len);
+                fx += force * dx / dist;
+                fy += force * dy / dist;
+            }
+
+            vx[i] = (vx[i] + fx) * damping;
+            vy[i] = (vy[i] + fy) * damping;
+
+            if vx[i].abs() < min_v { vx[i] = 0.0; }
+            if vy[i].abs() < min_v { vy[i] = 0.0; }
+
+            if nodes[i].kind != "Gateway" {
+                nodes[i].x += vx[i].clamp(-0.5, 0.5);
+                nodes[i].y += vy[i].clamp(-0.5, 0.5);
+            }
+        }
+    }
 }
 
 struct App {
     state: StateMachine,
     nodes: Vec<Node>,
+    edges: Vec<(usize, usize)>,
     last_update: String,
     scan_count: u64,
     camera: Camera,
@@ -255,6 +397,14 @@ struct App {
     intro_progress: f64,
     show_help: bool,
     content_area: Rect,
+    search_query: String,
+    search_active: bool,
+    prev_rx: u64,
+    prev_tx: u64,
+    rx_rate: f64,
+    tx_rate: f64,
+    iface: String,
+    traffic_time: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -290,9 +440,12 @@ impl StateMachine {
 
 impl App {
     fn new() -> Self {
+        let iface = detect_interface();
+        let (rx, tx) = read_traffic_bytes(&iface);
         Self {
             state: StateMachine::Splash,
             nodes: Vec::new(),
+            edges: Vec::new(),
             last_update: String::from("—"),
             scan_count: 0,
             camera: Camera::new(),
@@ -301,6 +454,14 @@ impl App {
             intro_progress: 0.0,
             show_help: false,
             content_area: Rect::new(0, 0, 0, 0),
+            search_query: String::new(),
+            search_active: false,
+            prev_rx: rx,
+            prev_tx: tx,
+            rx_rate: 0.0,
+            tx_rate: 0.0,
+            iface,
+            traffic_time: Instant::now(),
         }
     }
 
@@ -340,7 +501,21 @@ impl App {
                 self.intro_progress =
                     (self.intro_progress + 1.0 / INTRO_DURATION).min(1.0);
             }
+            StateMachine::Graph | StateMachine::Detail => {
+                if !self.nodes.is_empty() {
+                    force_directed_layout(&mut self.nodes, &self.edges, LAYOUT_ITER_PER_FRAME);
+                }
+            }
             _ => {}
+        }
+        if self.traffic_time.elapsed() >= Duration::from_secs(1) {
+            let (rx, tx) = read_traffic_bytes(&self.iface);
+            let elapsed = self.traffic_time.elapsed().as_secs_f64();
+            self.rx_rate = (rx - self.prev_rx) as f64 / elapsed;
+            self.tx_rate = (tx - self.prev_tx) as f64 / elapsed;
+            self.prev_rx = rx;
+            self.prev_tx = tx;
+            self.traffic_time = Instant::now();
         }
     }
 }
@@ -393,6 +568,7 @@ fn main() -> io::Result<()> {
     while running {
         if let Ok(fresh) = rx.try_recv() {
             app.nodes = fresh;
+            app.edges = build_edges(&app.nodes);
             app.scan_count += 1;
             app.last_update = format!("last scan: {}", humantime_since_epoch());
         }
@@ -429,24 +605,56 @@ fn handle_events(app: &mut App) -> io::Result<bool> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Enter => {
-                    if app.show_help {
+                    if app.search_active {
+                        if let Some(idx) = filtered_nodes(app).first() {
+                            app.selected_idx = *idx;
+                        }
+                        app.search_active = false;
+                        app.search_query.clear();
+                    } else if app.show_help {
                         app.show_help = false;
                     } else {
                         app.advance();
                     }
                 }
-                KeyCode::Char('?') | KeyCode::F(1) => {
+                KeyCode::Char('?') | KeyCode::F(1) if !app.search_active => {
                     app.show_help = !app.show_help;
                 }
+                KeyCode::Char('/') if !app.search_active && !app.show_help => {
+                    app.search_active = true;
+                    app.search_query.clear();
+                }
+                KeyCode::Char(c) if app.search_active => {
+                    if app.search_query.len() < 32 {
+                        app.search_query.push(c);
+                        let f = filtered_nodes(app);
+                        if !f.is_empty() {
+                            app.selected_idx = f[0];
+                        }
+                    }
+                }
+                KeyCode::Backspace if app.search_active => {
+                    app.search_query.pop();
+                    let f = filtered_nodes(app);
+                    if !f.is_empty() {
+                        app.selected_idx = f[0];
+                    }
+                }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    if app.show_help {
+                    if app.search_active {
+                        app.search_active = false;
+                        app.search_query.clear();
+                    } else if app.show_help {
                         app.show_help = false;
                     } else {
                         return Ok(false);
                     }
                 }
+                KeyCode::Char('r') if !app.search_active && !app.show_help => {
+                    app.scan_count = app.scan_count.saturating_sub(1);
+                }
                 KeyCode::Left => {
-                    if !app.show_help && !app.nodes.is_empty() {
+                    if !app.search_active && !app.show_help && !app.nodes.is_empty() {
                         app.selected_idx = if app.selected_idx == 0 {
                             app.nodes.len() - 1
                         } else {
@@ -455,7 +663,7 @@ fn handle_events(app: &mut App) -> io::Result<bool> {
                     }
                 }
                 KeyCode::Right => {
-                    if !app.show_help && !app.nodes.is_empty() {
+                    if !app.search_active && !app.show_help && !app.nodes.is_empty() {
                         app.selected_idx = (app.selected_idx + 1) % app.nodes.len();
                     }
                 }
@@ -466,6 +674,19 @@ fn handle_events(app: &mut App) -> io::Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn filtered_nodes(app: &App) -> Vec<usize> {
+    if app.search_query.is_empty() {
+        return (0..app.nodes.len()).collect();
+    }
+    let q = app.search_query.to_lowercase();
+    app.nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.name.to_lowercase().contains(&q) || n.ip.contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
@@ -546,6 +767,9 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     render_status_bar(frame, area, app);
     render_main_content(frame, area, app);
+    if app.search_active {
+        render_search_bar(frame, area, app);
+    }
     if app.show_help {
         render_help_overlay(frame, area);
     }
@@ -553,7 +777,7 @@ fn ui(frame: &mut ratatui::Frame, app: &App) {
 
 fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect) {
     let w = area.width.min(56);
-    let h = 13;
+    let h = 20;
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
     let overlay = Rect::new(x, y, w, h);
@@ -562,9 +786,15 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: Rect) {
         Line::from(Span::styled("  HELP", Style::new().fg(Color::Cyan).bold())),
         Line::from(""),
         Line::from(vec![Span::styled("  ← / →", Style::new().fg(Color::Cyan).bold()), Span::raw("  Select node")]),
-        Line::from(vec![Span::styled("  Enter", Style::new().fg(Color::Cyan).bold()), Span::raw("    Advance state / close help")]),
-        Line::from(vec![Span::styled("  ?  / F1", Style::new().fg(Color::Cyan).bold()), Span::raw("  Toggle this help")]),
-        Line::from(vec![Span::styled("  q  / Esc", Style::new().fg(Color::Cyan).bold()), Span::raw(" Quit / close help")]),
+        Line::from(vec![Span::styled("  /", Style::new().fg(Color::Cyan).bold()), Span::raw("      Search/filter nodes")]),
+        Line::from(vec![Span::styled("  r", Style::new().fg(Color::Cyan).bold()), Span::raw("      Trigger re-scan")]),
+        Line::from(vec![Span::styled("  Enter", Style::new().fg(Color::Cyan).bold()), Span::raw("    Advance state")]),
+        Line::from(vec![Span::styled("  ?  / F1", Style::new().fg(Color::Cyan).bold()), Span::raw("  Toggle help")]),
+        Line::from(vec![Span::styled("  q  / Esc", Style::new().fg(Color::Cyan).bold()), Span::raw(" Quit / close")]),
+        Line::from(""),
+        Line::from(vec![Span::styled("  Mouse:", Style::new().fg(Color::Yellow).bold())]),
+        Line::from(vec![Span::styled("  Click", Style::new().fg(Color::Cyan).bold()), Span::raw("   Select node")]),
+        Line::from(vec![Span::styled("  Scroll", Style::new().fg(Color::Cyan).bold()), Span::raw("  Zoom in/out")]),
         Line::from(""),
         Line::from(vec![Span::styled("  States:", Style::new().fg(Color::Yellow).bold())]),
         Line::from("  Splash → AnimatingIntro → Graph → AnimatingZoom → Detail"),
@@ -590,27 +820,33 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     };
     let alive = app.nodes.iter().filter(|n| n.latency_ms > 0.0).count();
 
+    let rx_s = human_bytes(app.rx_rate);
+    let tx_s = human_bytes(app.tx_rate);
     let status = Line::from(vec![
         Span::styled(
-            format!(" STATE: {} ", app.state.label()),
+            format!(" {} ", app.state.label()),
             Style::new().fg(Color::White).bg(Color::DarkGray),
         ),
-        Span::raw(" — "),
+        Span::raw("  "),
         Span::styled(&app.last_update, Style::new().fg(Color::Green)),
         Span::raw("  "),
-        Span::styled(format!("nodes: {}", node_count), Style::new().fg(Color::Blue)),
+        Span::styled(format!("nodes:{}", node_count), Style::new().fg(Color::Blue)),
         Span::raw("  "),
-        Span::styled(format!("alive: {}", alive), Style::new().fg(Color::Green)),
+        Span::styled(format!("alive:{}", alive), Style::new().fg(Color::Green)),
         Span::raw("  "),
-        Span::styled(format!("avg: {:.1}ms", avg), Style::new().fg(Color::Yellow)),
+        Span::styled(format!("avg:{:.0}ms", avg), Style::new().fg(Color::Yellow)),
         Span::raw("  "),
-        Span::styled("←/→", Style::new().fg(Color::Cyan).bold()),
-        Span::raw(" · "),
-        Span::styled("Enter", Style::new().fg(Color::Cyan).bold()),
-        Span::raw(" · "),
-        Span::styled("?", Style::new().fg(Color::Cyan).bold()),
-        Span::raw(" · "),
-        Span::styled("q", Style::new().fg(Color::Cyan).bold()),
+        Span::styled(format!("↓{}", rx_s), Style::new().fg(Color::Cyan)),
+        Span::raw(" "),
+        Span::styled(format!("↑{}", tx_s), Style::new().fg(Color::Magenta)),
+        Span::raw("  "),
+        Span::styled("←/→", Style::new().fg(Color::Cyan)),
+        Span::raw(" / "),
+        Span::styled("Enter", Style::new().fg(Color::Cyan)),
+        Span::raw(" / "),
+        Span::styled("?", Style::new().fg(Color::Cyan)),
+        Span::raw(" / "),
+        Span::styled("q", Style::new().fg(Color::Cyan)),
     ]);
     frame.render_widget(
         Paragraph::new(status)
@@ -619,6 +855,47 @@ fn render_status_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 
     frame.render_widget(Block::default(), main_area);
+}
+
+fn human_bytes(bps: f64) -> String {
+    if bps >= 1_000_000.0 {
+        format!("{:.1}MB/s", bps / 1_000_000.0)
+    } else if bps >= 1_000.0 {
+        format!("{:.1}KB/s", bps / 1_000.0)
+    } else {
+        format!("{:.0}B/s", bps)
+    }
+}
+
+fn render_search_bar(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let bar = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+    let q = format!(" Search: {}█", app.search_query);
+    let hint = if app.search_query.is_empty() {
+        "type to filter by name or IP..."
+    } else {
+        let count = filtered_nodes(app).len();
+        if count == 0 {
+            "no matches"
+        } else {
+            ""
+        }
+    };
+    let text = if !hint.is_empty() && app.search_query.is_empty() {
+        format!(" Search: {}  {}", app.search_query, hint)
+    } else if !hint.is_empty() && !hint.is_empty() {
+        format!(" Search: {} █ ({})", app.search_query, hint)
+    } else {
+        q
+    };
+    let style = if filtered_nodes(app).is_empty() && !app.search_query.is_empty() {
+        Style::new().fg(Color::Red).bg(Color::Black)
+    } else {
+        Style::new().fg(Color::Cyan).bg(Color::Black)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, style))),
+        bar,
+    );
 }
 
 fn render_main_content(frame: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -715,10 +992,10 @@ fn render_intro_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     frame.render_widget(msg, Rect::new(area.x, area.bottom().saturating_sub(3), area.width, 1));
 }
 
-fn draw_edges(ctx: &mut Context<'_>, nodes: &[Node], selected: usize, highlight: bool) {
-    for (i, j) in &edge_indices() {
-        if let (Some(a), Some(b)) = (nodes.get(*i), nodes.get(*j)) {
-            let is_connected = *i == selected || *j == selected;
+fn draw_edges(ctx: &mut Context<'_>, edges: &[(usize, usize)], nodes: &[Node], selected: usize, highlight: bool) {
+    for &(i, j) in edges {
+        if let (Some(a), Some(b)) = (nodes.get(i), nodes.get(j)) {
+            let is_connected = i == selected || j == selected;
             let color = if highlight && is_connected { Color::Cyan } else { Color::DarkGray };
             ctx.draw(&CanvasLine { x1: a.x, y1: a.y, x2: b.x, y2: b.y, color });
             if is_connected || !highlight {
@@ -742,7 +1019,7 @@ fn render_graph_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .x_bounds([-extent + look_at_x, extent + look_at_x])
         .y_bounds([-extent + look_at_y, extent + look_at_y])
         .paint(|ctx| {
-            draw_edges(ctx, &app.nodes, sel, true);
+            draw_edges(ctx, &app.edges, &app.nodes, sel, true);
             for (i, node) in app.nodes.iter().enumerate() {
                 let is_selected = i == sel;
                 let dot_color = if is_selected {
@@ -780,7 +1057,7 @@ fn render_zoom_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         .x_bounds([-extent + look_at_x, extent + look_at_x])
         .y_bounds([-extent + look_at_y, extent + look_at_y])
         .paint(|ctx| {
-            draw_edges(ctx, &app.nodes, sel, false);
+            draw_edges(ctx, &app.edges, &app.nodes, sel, false);
             for node in &app.nodes {
                 let dx = node.x - look_at_x;
                 let dy = node.y - look_at_y;
@@ -806,14 +1083,16 @@ fn render_zoom_canvas(frame: &mut ratatui::Frame, area: Rect, app: &App) {
 
 fn render_detail_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     let sel = app.selected_idx.min(app.nodes.len().max(1) - 1);
+    let f = filtered_nodes(app);
     let chunks = Layout::horizontal([Constraint::Length(34), Constraint::Min(10)]).split(area);
     let [left, right] = [chunks[0], chunks[1]];
 
     let mut list_lines = vec![
-        Line::from(Span::styled("NODES", Style::new().fg(Color::Cyan).bold())),
+        Line::from(Span::styled(format!("NODES ({})", f.len()), Style::new().fg(Color::Cyan).bold())),
         Line::from(Span::styled("───".repeat(17), Style::new().fg(Color::DarkGray))),
     ];
-    for (i, node) in app.nodes.iter().enumerate() {
+    for &i in &f {
+        let node = &app.nodes[i];
         let marker = if i == sel { "▶" } else { " " };
         let c = if i == sel { Color::LightCyan } else { Color::White };
         let lc = if node.latency_ms <= 0.0 {
@@ -839,7 +1118,7 @@ fn render_detail_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         ]));
     }
     list_lines.push(Line::from(""));
-    list_lines.push(Line::from(Span::styled("←/→ to select", Style::new().fg(Color::DarkGray))));
+    list_lines.push(Line::from(Span::styled("←/→ / / to select", Style::new().fg(Color::DarkGray))));
 
     let list = Paragraph::new(list_lines)
         .block(Block::default().borders(Borders::RIGHT).style(Style::new().fg(Color::DarkGray)));
@@ -912,8 +1191,12 @@ fn render_detail_panel(frame: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(")", Style::new().fg(Color::DarkGray)),
         ]));
 
-        let connected_to: Vec<&str> = neighbors_of(sel).iter()
-            .filter_map(|&idx| app.nodes.get(idx).map(|n| n.name.as_str()))
+        let connected_to: Vec<&str> = build_edges(&app.nodes).iter()
+            .filter_map(|&(a, b)| {
+                if a == sel { app.nodes.get(b).map(|n| n.name.as_str()) }
+                else if b == sel { app.nodes.get(a).map(|n| n.name.as_str()) }
+                else { None }
+            })
             .collect();
         if !connected_to.is_empty() {
             card_lines.push(Line::from(""));
